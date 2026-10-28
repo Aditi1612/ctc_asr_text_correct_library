@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+# model weights are not committed — distribute them separately (see README)
+*.safetensors
+*.bin
+*.pt
+*.pth
+checkpoint/
+# local-only docs that contain credentials — never commit
+docs/private/
