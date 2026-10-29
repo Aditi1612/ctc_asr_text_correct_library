@@ -184,11 +184,11 @@ stream.flush()                                     # finalize trailing speech
 
 - `pipe.stream(correct=False)` and `Transcriber().stream()` return raw STT
   only, and `corrected_text` stays `None`.
-- `accept()` blocks while a finished utterance is transcribed and corrected:
-  one short CTC pass plus one Gemini round-trip. If you can't block your
-  capture thread, run the corrector in a worker.
+- By default `accept()` blocks while a finished utterance is transcribed and
+  corrected: one short CTC pass plus one Gemini round-trip. Pass
+  `on_correction=` to correct in the background instead (see below).
 
-Runnable mic demo: `python examples/stream_mic.py`
+Runnable mic demo (low-latency setup): `python examples/stream_mic.py`
 
 ### Tuning `stream(...)`
 
@@ -200,6 +200,45 @@ Runnable mic demo: `python examples/stream_mic.py`
 | `start_speech_frames` | 3 | consecutive speech frames to trigger |
 | `pre_roll_ms` | 200 | audio kept before the trigger point |
 | `vad_aggressiveness` | 2 | webrtcvad 0–3 (higher = stricter) |
+| `on_correction` | `None` | if set, correct in background threads and call this with each corrected segment |
+| `correction_workers` | 4 | parallel Gemini calls in background mode |
+
+## Low latency (CPU only)
+
+After the speaker stops, latency is three parts: the `end_silence_ms` wait,
+the CTC pass, and the Gemini round-trip. Gemini dominates (~0.6–0.9 s; it's
+network-bound, and newer Flash-Lite models aren't faster), so the main lever is
+to show the raw text immediately and swap in the correction when it arrives:
+
+```python
+pipe = ASRCorrector(force_cpu=True, quantize=True)   # int8: ~35% faster CPU STT
+stream = pipe.stream(
+    end_silence_ms=300,
+    on_segment=lambda s: ui.show(s.start_time, s.text),               # raw, fast
+    on_correction=lambda s: ui.replace(s.start_time, s.corrected_text),  # ~0.8 s later
+)
+```
+
+Measured on this server (24-core Threadripper, CPU only, real-time-paced mic
+simulation over 4 sample utterances, speech end → text shown):
+
+| setup | raw text | corrected text |
+|---|---|---|
+| defaults (600 ms, fp32, blocking) | 1.6 s | 1.6 s |
+| 300 ms, int8, `on_correction` | **0.42 s** | 1.2 s |
+| 200 ms, int8, `on_correction` | 0.30 s | 1.1 s |
+
+- `on_correction` callbacks run on worker threads and can arrive out of order;
+  match them up by `seg.start_time`. `flush()` waits for all of them.
+- `quantize=True` gave identical transcripts to fp32 on every sample. It is
+  CPU-only (ignored on CUDA) and uses torch's dynamic quantization, which torch
+  plans to remove in 2.10.
+- CPU STT per utterance (24 threads, int8): ~75 ms for 2 s of audio, ~150 ms
+  for 5 s, ~640 ms for 22 s. Don't raise torch's thread count above the
+  physical core count: 48 threads on this 24-core CPU took ~2.9 s per clip.
+- Short `end_silence_ms` cuts sentences at pauses. The samples here never
+  split even at 150 ms, but dysarthric speech has longer mid-sentence pauses,
+  so test on real users before going below ~300 ms.
 
 ## Notes / limits
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Deque, Dict, List, Optional
 
@@ -36,6 +37,7 @@ class Transcriber:
         hf_cache_dir: Optional[str] = None,
         force_cpu: bool = False,
         use_half: bool = False,
+        quantize: bool = False,
         target_sr: int = 16000,
         min_len: int = 1600,
         cache: bool = True,
@@ -50,6 +52,7 @@ class Transcriber:
             hf_cache_dir=hf_cache_dir,
             force_cpu=force_cpu,
             use_half=use_half,
+            quantize=quantize,
             target_sr=target_sr,
             min_len=min_len,
             **config_kwargs,
@@ -209,6 +212,12 @@ class StreamingTranscriber:
     speaker pauses (``end_silence_ms`` of non-speech), the buffered utterance is
     transcribed (and corrected, if a corrector is attached) and returned as a
     :class:`Segment`. No partial hypotheses.
+
+    With ``on_correction`` set, correction no longer blocks: the segment is
+    returned (and ``on_segment`` fires) with the raw text only, and
+    ``on_correction(seg)`` fires from a worker thread once
+    ``seg.corrected_text`` is filled in. Corrections can arrive out of order;
+    use ``seg.start_time`` to place them. :meth:`flush` waits for all of them.
     """
 
     def __init__(
@@ -216,6 +225,8 @@ class StreamingTranscriber:
         transcriber: Transcriber,
         *,
         corrector: Optional[GeminiCorrector] = None,
+        on_correction: Optional[Callable[[Segment], None]] = None,
+        correction_workers: int = 4,
         frame_ms: int = 30,
         start_speech_frames: int = 3,
         end_silence_ms: int = 600,
@@ -227,6 +238,10 @@ class StreamingTranscriber:
     ):
         self.transcriber = transcriber
         self.corrector = corrector
+        self.on_correction = on_correction
+        self.correction_workers = correction_workers
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._pending: List[Future] = []
         self.sample_rate = transcriber.sample_rate
         self.frame_ms = frame_ms
         self.frame_len = int(self.sample_rate * frame_ms / 1000)
@@ -283,11 +298,17 @@ class StreamingTranscriber:
         return segments
 
     def flush(self) -> Optional[Segment]:
-        """Force-finalize whatever speech is currently buffered (call at end of stream)."""
+        """Force-finalize whatever speech is currently buffered (call at end of stream).
+
+        Also waits for any background corrections still in flight.
+        """
         seg = None
         if self._triggered:
             seg = self._finalize()
         self.reset()
+        pending, self._pending = self._pending, []
+        for future in pending:
+            future.result()  # re-raises a correction error (fallback=False)
         return seg
 
     # ------------------------------------------------------------------ #
@@ -354,8 +375,24 @@ class StreamingTranscriber:
             end_time=end_frame * self.frame_ms / 1000.0,
             raw_text=result.get("raw_transcription"),
         )
-        if self.corrector is not None:
+        background = self.corrector is not None and self.on_correction is not None
+        if self.corrector is not None and not background:
             seg.corrected_text = self.corrector.correct(text)
         if self.on_segment is not None:
             self.on_segment(seg)
+        if background:
+            self._correct_in_background(seg)
         return seg
+
+    def _correct_in_background(self, seg: Segment) -> None:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=self.correction_workers, thread_name_prefix="correct"
+            )
+
+        def job() -> None:
+            seg.corrected_text = self.corrector.correct(seg.text)
+            self.on_correction(seg)
+
+        self._pending = [f for f in self._pending if not f.done()]
+        self._pending.append(self._executor.submit(job))

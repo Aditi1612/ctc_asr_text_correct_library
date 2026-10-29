@@ -141,6 +141,31 @@ def test_streaming_with_fallback_correction(asr, sample):
 
 
 @needs_model
+def test_streaming_background_correction(asr, sample):
+    pipe = ASRCorrector(transcriber=asr, api_key="invalid-key")
+    wav, sr = sf.read(sample, dtype="float32")
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+    pad = np.zeros(int(sr * 0.3), dtype=np.float32)
+    corrected = []
+    stream = pipe.stream(on_correction=corrected.append)
+    got = stream.accept(np.concatenate([pad, wav, pad]), input_sr=sr)
+    tail = stream.flush()  # waits for background corrections
+    if tail:
+        got.append(tail)
+    assert got and sorted(id(s) for s in corrected) == sorted(id(s) for s in got)
+    assert all(s.corrected_text == " ".join(s.text.split()) for s in got)
+
+
+def test_quantized_matches_fp32(sample):
+    if default_model_dir() is None:
+        pytest.skip("no local checkpoint")
+    fp32 = Transcriber(force_cpu=True, cache=False)
+    int8 = Transcriber(force_cpu=True, quantize=True, cache=False)
+    assert int8.transcribe(sample) == fp32.transcribe(sample)
+
+
+@needs_model
 @needs_gemini
 def test_pipeline_live(asr, sample):
     r = ASRCorrector(transcriber=asr).process(sample)

@@ -3,8 +3,9 @@
     export GEMINI_API_KEY=...
     python examples/stream_mic.py
 
-Speak, pause, and each utterance is transcribed and corrected when you stop
-talking. Ctrl-C to quit. This file owns the microphone; the library itself only
+Speak, pause, and each utterance's raw transcript is printed as soon as you stop
+talking; the Gemini-corrected line follows when it arrives (background
+correction, so the mic loop never waits on the network). Ctrl-C to quit. This file owns the microphone; the library itself only
 consumes frames, so in your own app you can push audio from any source.
 """
 
@@ -21,16 +22,21 @@ except ImportError:
     sys.exit("pip install sounddevice to run this demo")
 
 
-def show(seg) -> None:
+def show_raw(seg) -> None:
     print(f"  [{seg.start_time:6.2f}s] {seg.text}")
-    print(f"           -> {seg.corrected_text}")
+
+
+def show_corrected(seg) -> None:
+    print(f"  [{seg.start_time:6.2f}s] -> {seg.corrected_text}")
 
 
 def main() -> None:
-    pipe = ASRCorrector()
+    pipe = ASRCorrector(quantize=True)  # int8 speeds up CPU inference; ignored on CUDA
     print(f"[device={pipe.device}] loading done. Speak now (Ctrl-C to stop).")
 
-    stream = pipe.stream(on_segment=show)
+    stream = pipe.stream(
+        end_silence_ms=300, on_segment=show_raw, on_correction=show_corrected
+    )
     audio_q: "queue.Queue[np.ndarray]" = queue.Queue()
 
     def cb(indata, frames, time_info, status):  # noqa: ARG001
@@ -45,7 +51,7 @@ def main() -> None:
             while True:
                 stream.accept(audio_q.get())
         except KeyboardInterrupt:
-            stream.flush()  # on_segment prints the trailing utterance
+            stream.flush()  # prints the trailing utterance, waits for pending corrections
             print("\nstopped.")
 
 

@@ -54,6 +54,10 @@ class Wav2Vec2CTCEngine:
             torch.backends.cudnn.benchmark = True
         self.model = self.model.to(device=self.device, dtype=self.compute_dtype)
         self.model.eval()
+        if config.quantize and self.device.type == "cpu":
+            self.model = torch.ao.quantization.quantize_dynamic(
+                self.model, {torch.nn.Linear}, dtype=torch.qint8
+            )
 
     @torch.inference_mode()
     def transcribe_waveform(
